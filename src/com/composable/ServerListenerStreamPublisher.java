@@ -107,7 +107,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				
 			};
 			if (item.start.after(new Date()) || (item.start.before(new Date()) && immediateIfStart))
-				timer.schedule(playTask, item.start);				
+				timer.schedule(playTask, item.start);
 			
 
 			// Check to see if the stream is already running with a non-repeating schedule and set it to not unpublish if so.
@@ -132,6 +132,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		}
 		
 		private synchronized void startPlaying(ScheduledItem toSchedule) {
+			logger.info("Start playing " + toSchedule.playlist.getName());
 			toSchedule.getPlaylist().open(stream);
 			captioner.setCaptionList(toSchedule.captions);
 			playlists.remove(toSchedule);
