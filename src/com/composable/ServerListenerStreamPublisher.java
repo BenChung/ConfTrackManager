@@ -64,14 +64,78 @@ import com.wowza.wms.vhost.VHostSingleton;
 public class ServerListenerStreamPublisher implements IServerNotify2
 {
 
-	private class StreamRunner {
+	public class StreamRunner {
 		private Stream stream;
 		private ScheduledItem scheduled;
 		private PlaylistItem currentItem;
+		
+		private StreamListener streamWatcher;
 		private CaptioningListener captioner;
 		
-		public void startPlaying(ScheduledItem toSchedule) {
+		private Timer timer;
+		private HashMap<ScheduledItem, TimerTask> schedule;
+		private HashSet<ScheduledItem> playlists;
+		
+		public StreamRunner(IApplicationInstance instance, Stream stream, boolean updateMetadata) {
+			this.stream = stream;
+			this.scheduled = null;
+			this.currentItem = null;
 			
+			this.captioner = new CaptioningListener();
+			stream.getPublisher().getStream().addVideoH264SEIListener(this.captioner);
+			
+			this.streamWatcher = new StreamListener(instance, updateMetadata);
+			stream.addListener(this.streamWatcher);
+			
+			this.timer = new Timer();
+			this.schedule = new HashMap<>();
+			this.playlists = new HashSet<>();
+		}
+
+		public synchronized void clear() {
+			timer.purge();
+			schedule.clear();
+			playlists.clear();
+		}
+		
+		public synchronized void schedule(ScheduledItem item, boolean immediateIfStart) {
+			TimerTask playTask = new TimerTask() {
+				@Override
+				public void run() {
+					startPlaying(item);
+				}
+				
+			};
+			if (item.start.after(new Date()) || (item.start.before(new Date()) && immediateIfStart))
+				timer.schedule(playTask, item.start);				
+			
+
+			// Check to see if the stream is already running with a non-repeating schedule and set it to not unpublish if so.
+			if (stream.getRepeat() == false)
+			{
+				logger.info(CLASS_NAME + " stream is set to not repeat, setUnpublishOnEnd: false " + stream.getName());
+				stream.setUnpublishOnEnd(false);
+			}
+			else
+				logger.info(CLASS_NAME + " stream is **NOT** set to not repeat, setUnpublishOnEnd: true " + stream.getName());
+			
+			schedule.put(item, playTask);
+			playlists.add(item);
+		}
+		
+		public synchronized void unschedule(ScheduledItem item) {
+			TimerTask playTask = schedule.get(item);
+			if (playTask == null)
+				logger.error("Attempted to unschedule an already unscheduled item " + item);
+			playTask.cancel();
+			playlists.remove(item);
+		}
+		
+		private synchronized void startPlaying(ScheduledItem toSchedule) {
+			toSchedule.getPlaylist().open(stream);
+			captioner.setCaptionList(toSchedule.captions);
+			playlists.remove(toSchedule);
+			logger.info("Set caption list " + toSchedule.captions);
 		}
 		
 		private class StreamListener implements IStreamActionNotify
@@ -99,23 +163,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					captioner.setCaptionItemIndex(item.getIndex(), offs); 
 					
 					if(updateMetadata)
-					{
-						Publisher publisher = stream.getPublisher();
-						AMFDataList amfList = new AMFDataList();
-		
-						amfList.add(new AMFDataItem("@setDataFrame"));
-						amfList.add(new AMFDataItem("onMetaData"));
-		
-						AMFDataMixedArray metaData = new AMFDataMixedArray();
-						metaData.put("title", name);
-		
-						amfList.add(metaData);
-						
-						byte[] dataData = amfList.serialize();
-			            long timecode = Math.max(publisher.getStream().getAudioTC(), publisher.getStream().getVideoTC());
-						
-			            publisher.addDataData(dataData, timecode);
-					}
+						sendItemName(stream, name);
 					if (stream.isSwitchLog())
 						logger.info(CLASS_NAME + " PlayList Item Start: " + name);
 				}
@@ -125,6 +173,24 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				}
 			}
 
+			private void sendItemName(Stream stream, String name) {
+				Publisher publisher = stream.getPublisher();
+				AMFDataList amfList = new AMFDataList();
+
+				amfList.add(new AMFDataItem("@setDataFrame"));
+				amfList.add(new AMFDataItem("onMetaData"));
+
+				AMFDataMixedArray metaData = new AMFDataMixedArray();
+				metaData.put("title", name);
+
+				amfList.add(metaData);
+				
+				byte[] dataData = amfList.serialize();
+				long timecode = Math.max(publisher.getStream().getAudioTC(), publisher.getStream().getVideoTC());
+				
+				publisher.addDataData(dataData, timecode);
+			}
+
 			@Override
 			public void onPlaylistItemStop(Stream stream, PlaylistItem item)
 			{
@@ -132,26 +198,13 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				if (stream.getPlaylist().contains(item) && item.getIndex() == (stream.getPlaylist().size() - 1)) {
 					Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "Schedules");
 					Object isSoftObj = appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "startOnFinish");
-
-					synchronized (lock) {
-						if (isSoftObj != null && (boolean)isSoftObj) {
-							appInstance.getProperties().setProperty(PROP_NAME_PREFIX + "startOnFinish", false);
-							for(List<ScheduledItem> schedules : schedulesMap.values())
-							{
-								Collections.sort(schedules);
-								for(ScheduledItem schedule : schedules) {
-									schedule.start();
-								}
-							}
-						}
-					}
 					
 					if (!stream.getRepeat() && stream.isUnpublishOnEnd())  //  Stream will be unpublished and shut down.  Any future schedules will be canceled.
 					{
-						Map<String, Stream> streams = (Map<String, Stream>)appInstance.getProperties().get(PROP_NAME_PREFIX + "Streams");
+						Map<String, StreamRunner> streams = (Map<String, StreamRunner>)appInstance.getProperties().get(PROP_NAME_PREFIX + "Runners");
 						if (streams != null)
 							streams.remove(stream.getName());
-						shutdownStream(appInstance, stream);
+						StreamRunner.this.shutdown(appInstance);
 						logger.info(CLASS_NAME + ": closing stream: " + stream.getName());
 					}
 				}
@@ -175,7 +228,6 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					this.caption = captions.get(idx);
 				else
 					this.caption = null;
-				logger.info("captions running with caption data " + this.caption);
 				this.timecodeOffs = absTimecodeOffs;
 				resetTTE();
 			}
@@ -227,12 +279,26 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			}
 			
 		}
+
+		public synchronized void shutdown(IApplicationInstance appInstance) {
+			timer.cancel();
+			
+			WMSProperties props = appInstance.getProperties();
+			props.remove(stream.getName());
+			
+			stream.closeAndWait();
+
+			Publisher publisher = stream.getPublisher();
+			publisher.getStream().removeVideoH264SEIListener(captioner);
+			publisher.unpublish();
+			publisher.close();
+			logger.info(CLASS_NAME + ": Stream shut down : " + stream.getName());
+		}
 	}
 	
 	private class ScheduledItem implements Comparable<ScheduledItem>
 	{
 		private IApplicationInstance appInstance;
-		private Timer timer;
 		private Date start;
 		private Playlist playlist;
 		private Stream stream;
@@ -245,82 +311,11 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			this.playlist = playlist;
 			this.stream = stream;
 			this.captions = captions;
-			timer = new Timer();
 		}
-
-		/**
-		 * Start a timer to load the schedule when it triggers.  After it triggers, remove the schedule from the schedulesMap.
-		 */
-		public void start()
-		{
-			// Check to see if the stream is already running with a non-repeating schedule and set it to not unpublish if so.
-			if (stream.getRepeat() == false)
-			{
-				logger.info(CLASS_NAME + " stream is set to not repeat, setUnpublishOnEnd: false " + stream.getName());
-				stream.setUnpublishOnEnd(false);
-			}
-			else
-				logger.info(CLASS_NAME + " stream is **NOT** set to not repeat, setUnpublishOnEnd: true " + stream.getName());
-
-			timer.schedule(new TimerTask()
-			{
-				@Override
-				public void run()
-				{
-					boolean res = playlist.open(stream);
-					logger.info(CLASS_NAME + " Scheduled stream is now live 1: " + stream.getName() + " with playlist " + playlist.getName() + " success "+res);
-					synchronized (lock) {
-						WMSProperties props = appInstance.getProperties();
-						Map<String, CaptioningListener> captionerMap = (Map<String, CaptioningListener>)props.getProperty(PROP_NAME_PREFIX + "Captioners");
-						if (captionerMap != null && captionerMap.containsKey(stream.getName())) {
-							captionerMap.get(stream.getName()).setCaptionList(captions);
-						}
-					}
-					removeFromList();
-					timer = null;
-					logger.info(CLASS_NAME + " Scheduled stream is now live 2: " + stream.getName() + " with playlist " + playlist.getName());
-					
-				}
-			}, start);
-			logger.info(CLASS_NAME + " scheduled playlist: " + playlist.getName() + " on stream: " + stream.getName() + " for:" + start.toString());
-		}
-
-		/**
-		 * Cancel the schedule and remove from schedulesMap.
-		 * @param soft 
-		 */
-		public void stop(boolean soft)
-		{
-			if (timer != null)
-			{
-				timer.cancel();
-				logger.info(CLASS_NAME + " cancelled playlist: " + playlist.getName() + " on stream: " + stream.getName() + " for:" + start.toString());
-				removeFromList();
-				timer = null;
-			}
-		}
-
 		
-		/**
-		 * Remove schedule from schedulesMap as it no longer needs to be referenced.
-		 */
-		private void removeFromList()
-		{
-			synchronized(lock)
-			{
-				Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)appInstance.getProperties().get(PROP_NAME_PREFIX + "Schedules");
-				if (schedulesMap != null)
-				{
-					List<ScheduledItem> schedules = schedulesMap.get(stream.getName());
-					if (schedules != null)
-					{
-						schedules.remove(this);
-						boolean stopOnEnd = (playlist.getRepeat() == true || (schedules.isEmpty() && playlist.getRepeat() == false));
-						stream.setUnpublishOnEnd(stopOnEnd);
-						logger.info(CLASS_NAME + ".ScheduledItem.removeFromList(): setting stopOnEnd: " + stopOnEnd + ", playlist.getRepeat(): " + playlist.getRepeat() + ", schedules.isEmpty():" + schedules.isEmpty());
-					}
-				}
-			}
+		public Playlist getPlaylist()
+		{ 
+			return this.playlist;
 		}
 
 		@Override
@@ -331,95 +326,6 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			return this.start.before(otherSchedule.start) ? -1 : 1;
 		}
 		
-	}
-
-	private class StreamListener implements IStreamActionNotify
-	{
-		private IApplicationInstance appInstance;
-		private boolean updateMetadata;
-
-		StreamListener(IApplicationInstance appInstance, boolean updateMetadata)
-		{
-			this.appInstance = appInstance;
-			this.updateMetadata = updateMetadata;
-		}
-
-		@Override
-		public void onPlaylistItemStart(Stream stream, PlaylistItem item)
-		{
-			try
-			{
-				String name = item.getName();
-				WMSProperties properties = appInstance.getProperties();
-				if (properties.getPropertyBoolean(PROP_NAME_PREFIX + "SendBroadcast", true))
-					appInstance.broadcastMsg("PlaylistItemStart", name);
-				synchronized (lock) {
-					Map<String, CaptioningListener> captionerMap = (Map<String, CaptioningListener>)properties.getProperty(PROP_NAME_PREFIX + "Captioners");
-					logger.info("start playlist "+stream.getName() + " map is not null " + (captionerMap != null) + " contains key? " + (captionerMap != null ? captionerMap.containsKey(stream.getName()) : ""));
-					if (captionerMap != null && captionerMap.containsKey(stream.getName())) {
-						long offs = stream.getPublisher().getLastVideoTimecode();
-						logger.info("captions starting on "+stream.getName() + " with item index "+item.getIndex());
-						captionerMap.get(stream.getName()).setCaptionItemIndex(item.getIndex(), offs); 
-					}
-				}
-				if(updateMetadata)
-				{
-					Publisher publisher = stream.getPublisher();
-					AMFDataList amfList = new AMFDataList();
-	
-					amfList.add(new AMFDataItem("@setDataFrame"));
-					amfList.add(new AMFDataItem("onMetaData"));
-	
-					AMFDataMixedArray metaData = new AMFDataMixedArray();
-					metaData.put("title", name);
-	
-					amfList.add(metaData);
-					
-					byte[] dataData = amfList.serialize();
-		            long timecode = Math.max(publisher.getStream().getAudioTC(), publisher.getStream().getVideoTC());
-					
-		            publisher.addDataData(dataData, timecode);
-				}
-				if (stream.isSwitchLog())
-					logger.info(CLASS_NAME + " PlayList Item Start: " + name);
-			}
-			catch (Exception ex)
-			{
-				logger.error(CLASS_NAME + " Get Item error: " + ex.getMessage());
-			}
-		}
-
-		@Override
-		public void onPlaylistItemStop(Stream stream, PlaylistItem item)
-		{
-			logger.info(CLASS_NAME + ": item stopped: " + item.getName() + " on stream " + stream.getName() + " from playlist " + item.getName());
-			if (stream.getPlaylist().contains(item) && item.getIndex() == (stream.getPlaylist().size() - 1)) {
-				Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "Schedules");
-				Object isSoftObj = appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "startOnFinish");
-
-				synchronized (lock) {
-					if (isSoftObj != null && (boolean)isSoftObj) {
-						appInstance.getProperties().setProperty(PROP_NAME_PREFIX + "startOnFinish", false);
-						for(List<ScheduledItem> schedules : schedulesMap.values())
-						{
-							Collections.sort(schedules);
-							for(ScheduledItem schedule : schedules) {
-								schedule.start();
-							}
-						}
-					}
-				}
-				
-				if (!stream.getRepeat() && stream.isUnpublishOnEnd())  //  Stream will be unpublished and shut down.  Any future schedules will be canceled.
-				{
-					Map<String, Stream> streams = (Map<String, Stream>)appInstance.getProperties().get(PROP_NAME_PREFIX + "Streams");
-					if (streams != null)
-						streams.remove(stream.getName());
-					shutdownStream(appInstance, stream);
-					logger.info(CLASS_NAME + ": closing stream: " + stream.getName());
-				}
-			}
-		}
 	}
 
 	private class AppInstanceListener implements IApplicationInstanceNotify
@@ -434,81 +340,11 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		public void onApplicationInstanceDestroy(IApplicationInstance appInstance)
 		{
 			WMSProperties props = appInstance.getProperties();
-			Map<String, Stream> streams = (Map<String, Stream>)props.remove(PROP_NAME_PREFIX + "Streams");
-			if (streams != null)
-				for (Stream stream : streams.values())
-					shutdownStream(appInstance, stream);
+			Map<String, StreamRunner> runners = (Map<String, StreamRunner>)props.remove(PROP_NAME_PREFIX + "Runners");
+			if (runners != null)
+				for (StreamRunner stream : runners.values())
+					stream.shutdown(appInstance);
 		}
-	}
-	
-	private class CaptioningListener implements IMediaStreamH264SEINotify {
-		private List<List<TimedTextEntry>> captions;
-		private List<TimedTextEntry> caption = new ArrayList<TimedTextEntry>();
-		private long timecodeOffs = 0;
-		
-		public void setCaptionList(List<List<TimedTextEntry>> captions) {
-			this.captions = captions;
-			this.caption = null;
-			logger.info("reset captions to " + this.captions);
-			resetTTE();
-		}
-		
-		public void setCaptionItemIndex(int idx, long absTimecodeOffs) {
-			if (captions != null && idx < captions.size())
-				this.caption = captions.get(idx);
-			else
-				this.caption = null;
-			logger.info("captions running with caption data " + this.caption);
-			this.timecodeOffs = absTimecodeOffs;
-			resetTTE();
-		}
-		
-		private TimedTextEntry lastTTE = null;
-		private TimedTextEntry currentTTE = null; 
-		private int tteIndex = 0;
-		private void resetTTE() {
-			if (caption == null) {
-				currentTTE = null;
-				return;
-			}
-			currentTTE = caption.get(0);
-			tteIndex = 0;
-		}
-		
-		@Override
-		public void onVideoH264Packet(IMediaStream stream, AMFPacket packet, H264SEIMessages seiMessages) {
-			if (caption == null) return;
-			long currentTime = packet.getAbsTimecode() - timecodeOffs;
-
-			while ((currentTTE == null || currentTTE.getEndTime() < currentTime) && tteIndex < caption.size())
-				currentTTE = caption.get(tteIndex++);
-
-			if (currentTTE != null && currentTime > currentTTE.getStartTime() && currentTTE != lastTTE) {
-				sendTextDataMessage(stream, currentTTE.getText());
-				logger.info("caption index p3 " + (currentTTE.getStartTime()) + " - "+(currentTTE.getEndTime()) + " text " + currentTTE.getText() + " abs time " +currentTime);
-				lastTTE = currentTTE;
-			}
-		}
-		
-		private void sendTextDataMessage(IMediaStream stream, String text)
-		{
-			try
-			{
-				AMFDataObj amfData = new AMFDataObj();
-				
-				amfData.put("text", new AMFDataItem(text));
-				amfData.put("language", new AMFDataItem("eng"));
-				amfData.put("trackid", new AMFDataItem(99));
-								
-				stream.sendDirect("onTextData", amfData);
-			}
-			catch(Exception e)
-			{
-				logger.error("ModulePublishSRTAsOnTextData#PublishThread.sendTextDataMessage["+stream.getContextStr()+"]: "+e.toString());
-				e.printStackTrace();
-			}
-		}
-		
 	}
 	
 	// find and parse .srt file for the specified stream
@@ -712,67 +548,42 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				Map<String, Stream> tmp = new HashMap<String, Stream>();
 				tmp.putAll(streamsList);
 				streamsList.clear();
-				Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)props.getProperty(PROP_NAME_PREFIX + "Schedules");
-				Map<String, CaptioningListener> captionerMap = (Map<String, CaptioningListener>)props.getProperty(PROP_NAME_PREFIX + "Captioners");
-				if (schedulesMap == null)
+				Map<String, StreamRunner> runners = (Map<String, StreamRunner>)props.getProperty(PROP_NAME_PREFIX + "Runners");
+				if (runners == null)
 				{
-					schedulesMap = new HashMap<String, List<ScheduledItem>>();
-					captionerMap = new HashMap<String, CaptioningListener>();
-					props.setProperty(PROP_NAME_PREFIX + "Schedules", schedulesMap);
-					props.setProperty(PROP_NAME_PREFIX + "Captioners", captionerMap);
+					runners = new HashMap<String, StreamRunner>();
+					props.setProperty(PROP_NAME_PREFIX + "Runners", runners);
 				}
 				for (int i = 0; i < streams.getLength(); i++)
 				{
 					Node streamItem = streams.item(i);
 					if (streamItem.getNodeType() == Node.ELEMENT_NODE)
 					{
-						parseStream(appInstance, props, updateMetadata, streamsList, tmp, captionerMap, streamItem);
+						parseStream(appInstance, props, updateMetadata, streamsList, tmp, runners, streamItem);
 					}
 				}
 
 				//  Shut down any streams still in tmp as they are not in the new schedule.
 				for (Stream stream : tmp.values()) {
-					captionerMap.remove(stream.getName());
+					StreamRunner removed = runners.remove(stream.getName());
 					logger.info("remove stream " + stream.getName());
-					shutdownStream(appInstance, stream);
+					removed.shutdown(appInstance);
 				}
 				tmp.clear();
 
 				//  Iterate through the existing streams for the application and remove any existing schedules.
-				for (Stream stream : streamsList.values())
-				{
-					synchronized(lock)
-					{
-						List<ScheduledItem> schedules = schedulesMap.remove(stream.getName());
-						if (schedules != null)
-						{
-							for (ScheduledItem item : schedules)
-								item.stop(soft);
-							schedules.clear();
-						}
-					}
-				}
-
+				for (StreamRunner stream : runners.values())
+					stream.clear();
+				
 				NodeList playList = document.getElementsByTagName("playlist");
 				if (playList.getLength() == 0)
 					return "No playlists defined in smil file";
 				
 				synchronized(lock)
 				{
-					String parseOutcome = parseSchedule(appInstance, soft, props, streamsList, schedulesMap, playList);
+					String parseOutcome = parseSchedule(appInstance, soft, props, streamsList, runners, playList);
 					if (parseOutcome != null)
 						return parseOutcome;
-					if (soft) {
-						props.setProperty(PROP_NAME_PREFIX + "startOnFinish", true);
-					} else {
-						for(List<ScheduledItem> schedules : schedulesMap.values())
-						{
-							Collections.sort(schedules);
-							for(ScheduledItem schedule : schedules) {
-								schedule.start();
-							}
-						}
-					}
 				}
 			}
 			catch (Exception ex)
@@ -785,7 +596,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 	}
 
 	private void parseStream(IApplicationInstance appInstance, WMSProperties props, boolean updateMetadata,
-			Map<String, Stream> streamsList, Map<String, Stream> tmp, Map<String, CaptioningListener> captionerMap,
+			Map<String, Stream> streamsList, Map<String, Stream> tmp, Map<String, StreamRunner> runnerMap,
 			Node streamItem) {
 		Element e = (Element)streamItem;
 		String streamName = e.getAttribute("name");
@@ -801,22 +612,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				logger.error(CLASS_NAME + " cannot create stream: " + streamName);
 				return;
 			}
-			IStreamActionNotify actionNotify = (IStreamActionNotify)props.get(PROP_NAME_PREFIX + "StreamListener");
-			if (actionNotify == null)
-			{
-				actionNotify = new StreamListener(appInstance, updateMetadata);
-				props.setProperty(PROP_NAME_PREFIX + "StreamListener", actionNotify);
-			}
-			stream.addListener(actionNotify);
-			CaptioningListener listener = null;
-			if (!captionerMap.containsKey(streamName)) {
-				listener = new CaptioningListener();
-				captionerMap.put(streamName, listener);
-				logger.info("put stream " + streamName);
-			} else {
-				listener = captionerMap.get(streamName);
-			}
-			stream.getPublisher().getStream().addVideoH264SEIListener(listener);
+			runnerMap.put(streamName, new StreamRunner(appInstance, stream, updateMetadata));
 			
 		}
 		tmp.remove(streamName);
@@ -824,7 +620,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		props.setProperty(streamName, stream);  // Required for ModuleLoopUntilLive.
 	}
 
-	private String parseSchedule(IApplicationInstance appInstance, boolean soft, WMSProperties props, Map<String, Stream> streamsList, Map<String, List<ScheduledItem>> schedulesMap, NodeList playList) throws Exception {
+	private String parseSchedule(IApplicationInstance appInstance, boolean soft, WMSProperties props, Map<String, Stream> streamsList, Map<String, StreamRunner> runners, NodeList playList) throws Exception {
 		WMSProperties serverProps = Server.getInstance().getProperties();
 		boolean switchLog = serverProps.getPropertyBoolean(PROP_NAME_PREFIX + "SwitchLog", true);
 		switchLog = props.getPropertyBoolean(PROP_NAME_PREFIX + "SwitchLog", switchLog);
@@ -908,57 +704,19 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					continue;
 				}
 
-				List<ScheduledItem> schedules = schedulesMap.get(streamName);
-				if (schedules == null)
-				{
-					schedules = new ArrayList<ScheduledItem>();
-					schedulesMap.put(streamName, schedules);
-				}
+				StreamRunner scheduler = runners.get(streamName);
 				stream.setSendOnMetadata(passMetaData);
 				stream.setSwitchLog(switchLog);
 				stream.setTimesInMilliseconds(timesInMilliseconds);
 				stream.setStartLiveOnPreviousKeyFrame(startLiveOnPreviousKeyFrame);
 				stream.setStartLiveOnPreviousBufferTime(startLiveOnPreviousBufferTime);
 				stream.setTimeOffsetBetweenItems(timeOffsetBetweenItems);
-				ScheduledItem schedule = new ScheduledItem(appInstance, startTime, playlist, captions, stream);
-				schedules.add(schedule);
+				ScheduledItem scheduledItem = new ScheduledItem(appInstance, startTime, playlist, captions, stream);
+				scheduler.schedule(scheduledItem, !soft);
 				logger.info(CLASS_NAME + " Scheduled: " + stream.getName() + " for: " + scheduled + " with playlist " + playlist.getName());
 			}
 		}
 		return null;
-	}
-
-	@SuppressWarnings("unchecked")
-	public void shutdownStream(IApplicationInstance appInstance, Stream stream)
-	{
-		if (stream == null)
-			return;
-
-		synchronized(lock)
-		{
-			WMSProperties props = appInstance.getProperties();
-			Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)props.get(PROP_NAME_PREFIX + "Schedules");
-			if (schedulesMap != null)
-			{
-				List<ScheduledItem> schedules = schedulesMap.remove(stream.getName());
-				if (schedules != null)
-					for (ScheduledItem schedule : schedules)
-						schedule.stop(false);
-			}
-			props.remove(stream.getName());
-			stream.closeAndWait();
-			Publisher publisher = stream.getPublisher();
-			Map<String, CaptioningListener> captionerMap = (Map<String, CaptioningListener>)props.getProperty(PROP_NAME_PREFIX + "Captioners");
-			if (captionerMap != null && captionerMap.containsKey(stream.getName())) {
-				publisher.getStream().removeVideoH264SEIListener(captionerMap.get(stream.getName()));
-			}
-			if (publisher != null)
-			{
-				publisher.unpublish();
-				publisher.close();
-			}
-			logger.info(CLASS_NAME + ": Stream shut down : " + stream.getName());
-		}
 	}
 
 	@Override

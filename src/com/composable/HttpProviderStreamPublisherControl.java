@@ -3,6 +3,7 @@ package com.composable;
 import java.io.*;
 import java.util.Map;
 
+import com.composable.ServerListenerStreamPublisher.StreamRunner;
 import com.wowza.util.HTTPUtils;
 import com.wowza.util.StringUtils;
 import com.wowza.wms.application.ApplicationInstance;
@@ -144,12 +145,12 @@ public class HttpProviderStreamPublisherControl extends HTTProvider2Base
 				}
 
 				@SuppressWarnings("unchecked")
-				Map<String, Stream> streams = (Map<String, Stream>)appInstance.getProperties().remove(ServerListenerStreamPublisher.PROP_NAME_PREFIX + "Streams");
+				Map<String, StreamRunner> streams = (Map<String, StreamRunner>)appInstance.getProperties().remove(ServerListenerStreamPublisher.PROP_NAME_PREFIX + "Runner");
 				if(streams != null)
 				{
-					for(Stream stream : streams.values())
+					for(StreamRunner stream : streams.values())
 					{
-						streamPublisher.shutdownStream(appInstance, stream);
+						stream.shutdown(appInstance);
 					}
 				}
 				appInstance.getProperties().remove(ServerListenerStreamPublisher.PROP_NAME_PREFIX + "ScheduleLoaded");
