@@ -6,15 +6,21 @@ package com.composable;
 
 import java.util.Map;
 
+import com.composable.ServerListenerStreamPublisher.StreamRunner;
 import com.wowza.wms.amf.*;
 import com.wowza.wms.application.*;
 import com.wowza.wms.client.*;
 import com.wowza.wms.logging.WMSLogger;
 import com.wowza.wms.logging.WMSLoggerFactory;
 import com.wowza.wms.logging.WMSLoggerIDs;
+import com.wowza.wms.mediacaster.IMediaCaster;
+import com.wowza.wms.mediacaster.IMediaCasterNotify2;
 import com.wowza.wms.module.*;
 import com.wowza.wms.request.*;
 import com.wowza.wms.server.Server;
+import com.wowza.wms.stream.IMediaStream;
+import com.wowza.wms.stream.IMediaStreamActionNotify;
+import com.wowza.wms.stream.IMediaStreamPlay;
 import com.wowza.wms.stream.publish.Stream;
 
 public class ModuleStreamPublisher extends ModuleBase
@@ -41,7 +47,55 @@ public class ModuleStreamPublisher extends ModuleBase
 			sendResult(client, params, e.getMessage());
 		}
 	}
+	
+	private class StreamListener implements IMediaStreamActionNotify
+	{
+		public void onPublish(IMediaStream stream, final String streamName, boolean isRecord, boolean isAppend)
+		{
+			logger.info(MODULE_NAME +".onPublish "+streamName);
+			if (streamPublisher != null) {
+				streamPublisher.notifyStreamPublish(appInstance, streamName);
+			}
 
+		}
+
+		public void onUnPublish(IMediaStream stream, String streamName, boolean isRecord, boolean isAppend)
+		{
+			logger.info(MODULE_NAME +".onUnPublish "+streamName);
+			if (streamPublisher != null) {
+				streamPublisher.notifyStreamUnpublish(appInstance, streamName);
+			}
+		}
+
+		public void onPause(IMediaStream stream, boolean isPause, double location)
+		{
+		}
+
+		public void onPlay(IMediaStream stream, String streamName, double playStart, double playLen, int playReset)
+		{
+		}
+
+		public void onSeek(IMediaStream stream, double location)
+		{
+		}
+
+		public void onStop(IMediaStream stream)
+		{
+		}
+	}
+
+	StreamListener streamListener = new StreamListener();
+	public void onStreamCreate(IMediaStream stream)
+	{
+		logger.info(MODULE_NAME +".onStreamCreate "+stream.getName());
+		stream.addClientListener(streamListener);
+	}
+
+	public void onStreamDestroy(IMediaStream stream)
+	{
+		logger.info(MODULE_NAME +".onStreamDestroy "+stream.getName());
+		stream.removeClientListener(streamListener);
+	}
 	/**
 	 * 
 	 * Get the StreamPublisher and save it as a Server property if it doesn't already exist then load schedule.
@@ -66,7 +120,7 @@ public class ModuleStreamPublisher extends ModuleBase
 				try
 				{
 					String ret = loadSchedule();			
-					logger.info(MODULE_NAME + ".onAppStart: ["+appInstance.getContextStr()+"]: "+ret, WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+					//logger.info(MODULE_NAME + ".onAppStart: ["+appInstance.getContextStr()+"]: "+ret, WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
 				}
 				catch (Exception e)
 				{
@@ -93,7 +147,7 @@ public class ModuleStreamPublisher extends ModuleBase
 	 */
 	public String loadSchedule() throws Exception
 	{
-		return streamPublisher.loadSchedule(appInstance, false);
+		return streamPublisher.startupModule(appInstance);
 	}
 	
 	/**
@@ -102,12 +156,12 @@ public class ModuleStreamPublisher extends ModuleBase
 	@SuppressWarnings("unchecked")
 	public void unloadSchedule()
 	{
-		Map<String, Stream> streams = (Map<String, Stream>)appInstance.getProperties().remove(PROP_NAME_PREFIX + "Streams");
+		Map<String, StreamRunner> streams = (Map<String, StreamRunner>)appInstance.getProperties().remove(PROP_NAME_PREFIX + "Runners");
 		if(streams != null)
 		{
-			for(Stream stream : streams.values())
+			for(StreamRunner stream : streams.values())
 			{
-				streamPublisher.shutdownStream(appInstance, stream);
+				stream.shutdown(appInstance);
 			}
 			streams.clear();
 		}

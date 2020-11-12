@@ -7,6 +7,7 @@ package com.composable;
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -18,6 +19,7 @@ import java.util.TimeZone;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.WeakHashMap;
+import java.util.function.Consumer;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -37,15 +39,21 @@ import com.wowza.wms.application.IApplication;
 import com.wowza.wms.application.IApplicationInstance;
 import com.wowza.wms.application.IApplicationInstanceNotify;
 import com.wowza.wms.application.WMSProperties;
+import com.wowza.wms.livestreamrecord.manager.IStreamRecorderConstants;
+import com.wowza.wms.livestreamrecord.manager.StreamRecorderParameters;
 import com.wowza.wms.logging.WMSLogger;
 import com.wowza.wms.logging.WMSLoggerFactory;
 import com.wowza.wms.logging.WMSLoggerIDs;
 import com.wowza.wms.media.h264.H264SEIMessages;
+import com.wowza.wms.mediacaster.IMediaCaster;
+import com.wowza.wms.mediacaster.IMediaCasterNotify2;
 import com.wowza.wms.server.IServer;
 import com.wowza.wms.server.IServerNotify2;
 import com.wowza.wms.server.Server;
 import com.wowza.wms.stream.IMediaStream;
+import com.wowza.wms.stream.IMediaStreamActionNotify;
 import com.wowza.wms.stream.IMediaStreamH264SEINotify;
+import com.wowza.wms.stream.IMediaStreamPlay;
 import com.wowza.wms.stream.MediaReaderItem;
 import com.wowza.wms.stream.publish.IStreamActionNotify;
 import com.wowza.wms.stream.publish.Playlist;
@@ -63,9 +71,9 @@ import com.wowza.wms.vhost.VHostSingleton;
 
 public class ServerListenerStreamPublisher implements IServerNotify2
 {
-
 	public class StreamRunner {
 		private Stream stream;
+		private String fillerItem;
 		private ScheduledItem scheduled;
 		private PlaylistItem currentItem;
 		
@@ -75,11 +83,13 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		private Timer timer;
 		private HashMap<ScheduledItem, TimerTask> schedule;
 		private HashSet<ScheduledItem> playlists;
+		private IApplicationInstance instance;
 		
-		public StreamRunner(IApplicationInstance instance, Stream stream, boolean updateMetadata) {
+		public StreamRunner(IApplicationInstance instance, Stream stream, String filleritem, boolean updateMetadata) {
 			this.stream = stream;
 			this.scheduled = null;
 			this.currentItem = null;
+			this.fillerItem = filleritem;
 			
 			this.captioner = new CaptioningListener();
 			stream.getPublisher().getStream().addVideoH264SEIListener(this.captioner);
@@ -90,6 +100,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			this.timer = new Timer();
 			this.schedule = new HashMap<>();
 			this.playlists = new HashSet<>();
+			this.instance = instance;
 		}
 
 		public synchronized void clear() {
@@ -98,15 +109,14 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			playlists.clear();
 		}
 		
-		public synchronized void schedule(ScheduledItem item, boolean immediateIfStart) {
+		public synchronized void schedule(ScheduledItem item) {
 			TimerTask playTask = new TimerTask() {
 				@Override
 				public void run() {
 					startPlaying(item);
 				}
-				
 			};
-			if (item.start.after(new Date()) || (item.start.before(new Date()) && immediateIfStart))
+			if (item.start.after(new Date()))
 				timer.schedule(playTask, item.start);
 			
 
@@ -123,6 +133,21 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			playlists.add(item);
 		}
 		
+		public synchronized void resume() {
+			ScheduledItem mostRecent = null;
+			Date now = new Date();
+			for (ScheduledItem item : schedule.keySet()) {
+				if (mostRecent == null && item.start.before(now))
+					mostRecent = item;
+				else if (mostRecent != null && item.start.before(now) && item.start.after(mostRecent.start))
+					mostRecent = item;
+			}
+			if (mostRecent != null) {
+				logger.info(CLASS_NAME + " resuming video " + mostRecent.playlist.getName() + " on " + stream.getName() + " is before " + mostRecent.start.before(now));
+				timer.schedule(schedule.get(mostRecent), mostRecent.start);
+			}
+		}
+		
 		public synchronized void unschedule(ScheduledItem item) {
 			TimerTask playTask = schedule.get(item);
 			if (playTask == null)
@@ -132,11 +157,101 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		}
 		
 		private synchronized void startPlaying(ScheduledItem toSchedule) {
+			// if we are interrupting a previous live stream, then stop the recording for it
+			if (scheduled != null && scheduled.recordingFile != null) {
+				instance.getVHost().getLiveStreamRecordManager().getRecorder(instance, stream.getName()).stopRecorder();
+			}
+			resetWaitForLive();
 			logger.info("Start playing " + toSchedule.playlist.getName());
 			toSchedule.getPlaylist().open(stream);
 			captioner.setCaptionList(toSchedule.captions);
 			playlists.remove(toSchedule);
+			
+			if (toSchedule.recordingFile != null) {
+				StreamRecorderParameters params = new StreamRecorderParameters(instance);
+				params.segmentationType = IStreamRecorderConstants.SEGMENT_NONE;
+				params.versioningOption = IStreamRecorderConstants.APPEND_FILE;
+				params.fileFormat = IStreamRecorderConstants.FORMAT_MP4;
+				params.startOnKeyFrame =  true;
+				params.recordData = true;
+				params.outputFile = toSchedule.recordingFile;
+				instance.getVHost().getLiveStreamRecordManager().startRecording(instance, toSchedule.stream.getName(), params);
+			}
+			scheduled = toSchedule;
 			logger.info("Set caption list " + toSchedule.captions);
+		}
+
+		// these are called whenever the server sees a new stream get published or unpublished
+		private String waitingForLive = null; // if this is non-null, then we're waiting for it to go live
+		private long waitForLiveTimeout = 1000;
+		public synchronized void onStreamPublish(String streamName) {
+			logger.info(CLASS_NAME + " detected new live " + streamName + " waiting for " + streamName);
+			if (!waitingForLive.equals(streamName)) 
+				return;
+			logger.info(CLASS_NAME + " resuming live " + streamName);
+			
+			long startTime = System.currentTimeMillis();
+			while (startTime + waitForLiveTimeout > System.currentTimeMillis())
+			{
+				IMediaStream liveStream = instance.getStreams().getStream(streamName);
+				if (liveStream != null)
+				{
+					boolean ready = false;
+					if(liveStream.isPublishStreamReady(true, true))
+					{
+						AMFPacket lastKeyFrame = liveStream.getLastKeyFrame();
+						if(lastKeyFrame != null)
+						{
+							long lastKeyframeTC = lastKeyFrame.getAbsTimecode();
+							List<AMFPacket> packets = liveStream.getPlayPackets();
+							for(AMFPacket packet : packets)
+							{
+								if(packet.isAudio())
+								{
+									long audioTC = packet.getAbsTimecode();
+									if(Math.abs(lastKeyframeTC - audioTC) < 50)
+									{
+										ready = true;
+										break;
+									}
+								}
+							}
+						}
+					}
+					if(ready)
+					{
+						break;
+					}
+				}
+				
+				try
+				{
+					Thread.sleep(50);
+				}
+				catch (InterruptedException e)
+				{
+				}
+			}
+			logger.info(CLASS_NAME + " resumed live " + streamName);
+			// check to see if the live stream is still published.
+			if(instance.getStreams().getStream(streamName) == null)
+				return;
+			ArrayList<List<TimedTextEntry>> captions = new ArrayList<>();
+			captions.add(null);
+			captioner.setCaptionList(captions); // we just added a new playlist item without captions associated with it
+			stream.play(streamName, -2, -1, true);
+		}
+
+		public synchronized void onStreamUnpublish(String streamName) {
+			// other code will handle this
+		}
+		
+		private synchronized void resetWaitForLive() {
+			waitingForLive = null;
+		}
+		
+		private synchronized void waitForNextLive(String streamWaitingFor) {
+			waitingForLive = streamWaitingFor;
 		}
 		
 		private class StreamListener implements IStreamActionNotify
@@ -162,6 +277,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					long offs = stream.getPublisher().getLastVideoTimecode();
 					logger.info("captions starting on "+stream.getName() + " with item index "+item.getIndex());
 					captioner.setCaptionItemIndex(item.getIndex(), offs); 
+					currentItem = item;
 					
 					if(updateMetadata)
 						sendItemName(stream, name);
@@ -197,16 +313,41 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			{
 				logger.info(CLASS_NAME + ": item stopped: " + item.getName() + " on stream " + stream.getName() + " from playlist " + item.getName());
 				if (stream.getPlaylist().contains(item) && item.getIndex() == (stream.getPlaylist().size() - 1)) {
-					Map<String, List<ScheduledItem>> schedulesMap = (Map<String, List<ScheduledItem>>)appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "Schedules");
-					Object isSoftObj = appInstance.getProperties().getProperty(PROP_NAME_PREFIX + "startOnFinish");
+					logger.info(CLASS_NAME + ": item stopped was final");
+					// stop recording if not live
+					if (scheduled.recordingFile != null && item.getStart() != -2) {
+						instance.getVHost().getLiveStreamRecordManager().getRecorder(instance, stream.getName()).stopRecorder();
+					}
+					// TODO check for error and send email
 					
-					if (!stream.getRepeat() && stream.isUnpublishOnEnd())  //  Stream will be unpublished and shut down.  Any future schedules will be canceled.
+					if (!stream.getRepeat())  //  Stream will be unpublished and shut down.  Any future schedules will be canceled.
 					{
+						logger.info(CLASS_NAME + ": was not repeating");
 						Map<String, StreamRunner> streams = (Map<String, StreamRunner>)appInstance.getProperties().get(PROP_NAME_PREFIX + "Runners");
+						
+						if (item.getStart() == -2) {
+							waitForNextLive(item.getName()); // wait for the stream we were sitting on to go live again
+						}
+						// play the filler video
+						if (fillerItem != null) {
+							ArrayList<List<TimedTextEntry>> captions = new ArrayList<>();
+							captions.add(null);
+							captioner.setCaptionList(captions); // we just added a new playlist item without captions associated with it
+							boolean result = stream.play(fillerItem, -1, -1, true);
+							logger.info(CLASS_NAME + ": starting filler item success: " + result);
+						}
+							
+						// this was a streamed event, we should loop the dummy video until we get something else
+						// hook a mediacasterlistener up to the stream we're watching for
+						// which should switch us live when the stream does and get rid of itself; when it stops, we'll end up back here
+						// othw start filler
+						// if something else grabs the stream from the schedule, need to disable the mediacasterlistener
+						/*
 						if (streams != null)
 							streams.remove(stream.getName());
 						StreamRunner.this.shutdown(appInstance);
 						logger.info(CLASS_NAME + ": closing stream: " + stream.getName());
+						*/
 					}
 				}
 			}
@@ -235,6 +376,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			
 			private TimedTextEntry lastTTE = null;
 			private TimedTextEntry currentTTE = null; 
+			private Timer tteScheduler = new Timer();
 			private int tteIndex = 0;
 			private void resetTTE() {
 				if (caption == null) {
@@ -252,6 +394,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 
 				while ((currentTTE == null || currentTTE.getEndTime() < currentTime) && tteIndex < caption.size())
 					currentTTE = caption.get(tteIndex++);
+				
 
 				if (currentTTE != null && currentTime > currentTTE.getStartTime() && currentTTE != lastTTE) {
 					sendTextDataMessage(stream, currentTTE.getText());
@@ -295,6 +438,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			publisher.close();
 			logger.info(CLASS_NAME + ": Stream shut down : " + stream.getName());
 		}
+
 	}
 	
 	private class ScheduledItem implements Comparable<ScheduledItem>
@@ -304,14 +448,20 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		private Playlist playlist;
 		private Stream stream;
 		private List<List<TimedTextEntry>> captions;
+		private String recordingFile;
+		
+		public String getRecordingFile() {
+			return recordingFile;
+		}
 
-		public ScheduledItem(IApplicationInstance appInstance, Date start, Playlist playlist, List<List<TimedTextEntry>> captions, Stream stream)
+		public ScheduledItem(IApplicationInstance appInstance, Date start, Playlist playlist, List<List<TimedTextEntry>> captions, Stream stream, String recordingFile)
 		{
 			this.appInstance = appInstance;
 			this.start = start;
 			this.playlist = playlist;
 			this.stream = stream;
 			this.captions = captions;
+			this.recordingFile = recordingFile;
 		}
 		
 		public Playlist getPlaylist()
@@ -394,6 +544,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 	{
 		server.getProperties().setProperty(PROP_STREAMPUBLISHER, this);
 	}
+	
 
 	@Override
 	public void onServerInit(IServer server)
@@ -462,11 +613,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				return;
 			}
 			
-			//  Module onAppStart runs as soon as getAppInstance() is called so check to see if the module loaded the schedule.
-			if (appInstance.getProperties().getPropertyBoolean(PROP_NAME_PREFIX + "ScheduleLoaded", false))
-			{
-				logger.info(CLASS_NAME + ": Schedule loaded by module.");
-			}
+
 			else
 			{
 				vhost.getThreadPool().execute(new Runnable() {
@@ -474,17 +621,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					@Override
 					public void run()
 					{
-						String ret = null;
-						try
-						{
-							ret = loadSchedule(appInstance, false);
-						}
-						catch (Exception e)
-						{
-							logger.error(CLASS_NAME + ": " + e.getMessage(), e);
-						}
-						appInstance.getProperties().setProperty(PROP_NAME_PREFIX + "ScheduleLoaded", true);
-						logger.info(CLASS_NAME + ": " + ret);
+						startupModule(appInstance);
 					}
 				});
 			}
@@ -497,6 +634,45 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 
 	}
 
+	public String startupModule(IApplicationInstance appInstance) {
+		String ret = null;
+		synchronized (lock) {
+			//  Module onAppStart runs as soon as getAppInstance() is called so check to see if the module loaded the schedule.
+			if (appInstance.getProperties().getPropertyBoolean(PROP_NAME_PREFIX + "ScheduleLoaded", false))
+			{
+				logger.info(CLASS_NAME + ": Schedule loaded by module.");
+				return "";
+			}
+			try
+			{
+				ret = loadSchedule(appInstance, false);
+			}
+			catch (Exception e)
+			{
+				logger.error(CLASS_NAME + ": " + e.getMessage(), e);
+			}
+			appInstance.getProperties().setProperty(PROP_NAME_PREFIX + "ScheduleLoaded", true);
+			logger.info(CLASS_NAME + ": " + ret);
+		}
+		return ret;
+		
+	}
+
+	public void notifyStreamPublish(IApplicationInstance appInstance, String streamName) {
+		WMSProperties props = appInstance.getProperties();
+		Map<String, StreamRunner> runners = (Map<String, StreamRunner>)props.getProperty(PROP_NAME_PREFIX + "Runners");
+		for (StreamRunner runner : runners.values()) {
+			runner.onStreamPublish(streamName);
+		}
+	}
+	
+	public void notifyStreamUnpublish(IApplicationInstance appInstance, String streamName) {
+		WMSProperties props = appInstance.getProperties();
+		Map<String, StreamRunner> runners = (Map<String, StreamRunner>)props.getProperty(PROP_NAME_PREFIX + "Runners");
+		for (StreamRunner runner : runners.values()) {
+			runner.onStreamUnpublish(streamName);
+		}
+	}
 	
 	@SuppressWarnings("unchecked")
 	public String loadSchedule(IApplicationInstance appInstance, boolean soft) throws Exception
@@ -505,6 +681,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		WMSProperties props = appInstance.getProperties();
 		synchronized(lock)
 		{
+			logger.info(CLASS_NAME + ": loading "+appInstance.getProperties().getPropertyBoolean(PROP_NAME_PREFIX + "ScheduleLoaded", false));
 			String scheduleSmil = serverProps.getPropertyStr(PROP_NAME_PREFIX + "SmilFile", "streamschedule.smil");
 			scheduleSmil = props.getPropertyStr(PROP_NAME_PREFIX + "SmilFile", scheduleSmil);
 			String storageDir = appInstance.getStreamStorageDir();
@@ -586,6 +763,9 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 					if (parseOutcome != null)
 						return parseOutcome;
 				}
+				if (!soft) {
+					runners.values().stream().forEach(x->x.resume());
+				}
 			}
 			catch (Exception ex)
 			{
@@ -601,6 +781,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 			Node streamItem) {
 		Element e = (Element)streamItem;
 		String streamName = e.getAttribute("name");
+		String fillerName = e.getAttribute("filler");
 
 		logger.info(CLASS_NAME + ": Stream name is '" + streamName + "'");
 
@@ -613,7 +794,7 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 				logger.error(CLASS_NAME + " cannot create stream: " + streamName);
 				return;
 			}
-			runnerMap.put(streamName, new StreamRunner(appInstance, stream, updateMetadata));
+			runnerMap.put(streamName, new StreamRunner(appInstance, stream, fillerName, updateMetadata));
 			
 		}
 		tmp.remove(streamName);
@@ -640,81 +821,88 @@ public class ServerListenerStreamPublisher implements IServerNotify2
 		int timeOffsetBetweenItems = serverProps.getPropertyInt(PROP_NAME_PREFIX + "TimeOffsetBetweenItems", 0);
 		timeOffsetBetweenItems = props.getPropertyInt(PROP_NAME_PREFIX + "TimeOffsetBetweenItems", timeOffsetBetweenItems);	
 		
-		for (int i = 0; i < playList.getLength(); i++)
-		{
-			Node scheduledPlayList = playList.item(i);
-
-			if (scheduledPlayList.getNodeType() == Node.ELEMENT_NODE)
+		synchronized (lock) {
+			Arrays.stream(Thread.currentThread().getStackTrace()).forEach(s -> System.out.println(
+			    "\tat " + s.getClassName() + "." + s.getMethodName() + "(" + s.getFileName() + ":" + s
+		        .getLineNumber() + ")"));
+			for (int i = 0; i < playList.getLength(); i++)
 			{
-				Element e = (Element)scheduledPlayList;
-
-				NodeList videos = e.getElementsByTagName("video");
-				if (videos.getLength() == 0) {
-					return "No videos defined in stream";
-				}
-
-				String streamName = e.getAttribute("playOnStream");
-				if (streamName.length() == 0)
-					continue;
-				String playlistName = e.getAttribute("name");
-				if (playlistName.length() == 0)
-					continue;
-
-				Playlist playlist = new Playlist(playlistName);
-				playlist.setRepeat((e.getAttribute("repeat").equals("false")) ? false : true);
-
-				ArrayList<List<TimedTextEntry>> captions = new ArrayList<List<TimedTextEntry>>();
-				for (int j = 0; j < videos.getLength(); j++)
+				Node scheduledPlayList = playList.item(i);
+	
+				if (scheduledPlayList.getNodeType() == Node.ELEMENT_NODE)
 				{
-					Node video = videos.item(j);
-					if (video.getNodeType() == Node.ELEMENT_NODE)
-					{
-						Element e2 = (Element)video;
-						String src = e2.getAttribute("src");
-						Integer start = Integer.parseInt(e2.getAttribute("start"));
-						Integer length = Integer.parseInt(e2.getAttribute("length"));
-						// remove any prefix from live streams.
-						if (start <= -2 && src.indexOf(":") != -1)
-							src = src.substring(src.indexOf(":") + 1);
-						if (e2.getAttribute("captions").isEmpty()) {
-							captions.add(null);
-						} else {
-							captions.add(simpleSRTParse(appInstance, e2.getAttribute("captions"), ""));
-						}
-						playlist.addItem(src, start, length);
+					Element e = (Element)scheduledPlayList;
+	
+					NodeList videos = e.getElementsByTagName("video");
+					if (videos.getLength() == 0) {
+						return "No videos defined in stream";
 					}
+	
+					String streamName = e.getAttribute("playOnStream");
+					if (streamName.length() == 0)
+						continue;
+					String playlistName = e.getAttribute("name");
+					if (playlistName.length() == 0)
+						continue;
+	
+					Playlist playlist = new Playlist(playlistName);
+					playlist.setRepeat((e.getAttribute("repeat").equals("false")) ? false : true);
+	
+					ArrayList<List<TimedTextEntry>> captions = new ArrayList<List<TimedTextEntry>>();
+					for (int j = 0; j < videos.getLength(); j++)
+					{
+						Node video = videos.item(j);
+						if (video.getNodeType() == Node.ELEMENT_NODE)
+						{
+							Element e2 = (Element)video;
+							String src = e2.getAttribute("src");
+							Integer start = Integer.parseInt(e2.getAttribute("start"));
+							Integer length = Integer.parseInt(e2.getAttribute("length"));
+							// remove any prefix from live streams.
+							if (start <= -2 && src.indexOf(":") != -1)
+								src = src.substring(src.indexOf(":") + 1);
+							if (e2.getAttribute("captions").isEmpty()) {
+								captions.add(null);
+							} else {
+								captions.add(simpleSRTParse(appInstance, e2.getAttribute("captions"), ""));
+							}
+							playlist.addItem(src, start, length);
+						}
+					}
+					String scheduled = e.getAttribute("scheduled");
+					SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+					parser.setTimeZone(TimeZone.getTimeZone("GMT"));
+					logger.info(CLASS_NAME + " parser time zone " + parser.getTimeZone());
+					Date startTime = null;
+					try
+					{
+						startTime = parser.parse(scheduled);
+						logger.info(CLASS_NAME + ".loadSchedule [scheduled: " + scheduled + ", startTime: " + startTime.toString() + ", time: " + startTime.getTime() + ", parser.timezone: " + parser.getTimeZone().getDisplayName() + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+					}
+					catch (Exception z)
+					{
+						throw new Exception(CLASS_NAME + " Parsing schedule time " + scheduled + " for " + playlistName + " failed.", z);
+					}
+					Stream stream = streamsList.get(streamName);
+					if (stream == null)
+					{
+						logger.warn(CLASS_NAME + " Stream does not exist for playlist: " + playlistName + " : " + streamName);
+						continue;
+					}
+					
+					String recordingFile = e.getAttribute("recorded");
+	
+					StreamRunner scheduler = runners.get(streamName);
+					stream.setSendOnMetadata(false);
+					stream.setSwitchLog(switchLog);
+					stream.setTimesInMilliseconds(timesInMilliseconds);
+					stream.setStartLiveOnPreviousKeyFrame(true);
+					stream.setStartLiveOnPreviousBufferTime(startLiveOnPreviousBufferTime);
+					stream.setTimeOffsetBetweenItems(timeOffsetBetweenItems);
+					ScheduledItem scheduledItem = new ScheduledItem(appInstance, startTime, playlist, captions, stream, recordingFile);
+					scheduler.schedule(scheduledItem);
+					logger.info(CLASS_NAME + " Scheduled: " + stream.getName() + " for: " + scheduled + " with playlist " + playlist.getName());
 				}
-				String scheduled = e.getAttribute("scheduled");
-				SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-				parser.setTimeZone(TimeZone.getTimeZone("GMT"));
-				logger.info(CLASS_NAME + " parser time zone " + parser.getTimeZone());
-				Date startTime = null;
-				try
-				{
-					startTime = parser.parse(scheduled);
-					logger.info(CLASS_NAME + ".loadSchedule [scheduled: " + scheduled + ", startTime: " + startTime.toString() + ", time: " + startTime.getTime() + ", parser.timezone: " + parser.getTimeZone().getDisplayName() + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				}
-				catch (Exception z)
-				{
-					throw new Exception(CLASS_NAME + " Parsing schedule time " + scheduled + " for " + playlistName + " failed.", z);
-				}
-				Stream stream = streamsList.get(streamName);
-				if (stream == null)
-				{
-					logger.warn(CLASS_NAME + " Stream does not exist for playlist: " + playlistName + " : " + streamName);
-					continue;
-				}
-
-				StreamRunner scheduler = runners.get(streamName);
-				stream.setSendOnMetadata(passMetaData);
-				stream.setSwitchLog(switchLog);
-				stream.setTimesInMilliseconds(timesInMilliseconds);
-				stream.setStartLiveOnPreviousKeyFrame(startLiveOnPreviousKeyFrame);
-				stream.setStartLiveOnPreviousBufferTime(startLiveOnPreviousBufferTime);
-				stream.setTimeOffsetBetweenItems(timeOffsetBetweenItems);
-				ScheduledItem scheduledItem = new ScheduledItem(appInstance, startTime, playlist, captions, stream);
-				scheduler.schedule(scheduledItem, !soft);
-				logger.info(CLASS_NAME + " Scheduled: " + stream.getName() + " for: " + scheduled + " with playlist " + playlist.getName());
 			}
 		}
 		return null;
